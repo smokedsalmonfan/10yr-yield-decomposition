@@ -1,0 +1,361 @@
+# ==========================================================
+# 0. PIP INSTALLS FOR GOOGLE COLAB
+# ==========================================================
+!pip install -q yfinance fredapi pandas numpy matplotlib
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from fredapi import Fred
+import matplotlib.pyplot as plt
+import warnings
+import os
+from datetime import date
+
+warnings.filterwarnings("ignore")
+
+# ==========================================================
+# 1. DATA COLLECTION
+# ==========================================================
+
+def get_fred_api_key():
+    """
+    Resolves a FRED API key without ever printing/hardcoding it.
+    Get a free key at https://fred.stlouisfed.org/docs/api/api_key.html
+    """
+    try:
+        from google.colab import userdata
+        key = userdata.get("FRED_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    key = os.environ.get("FRED_API_KEY")
+    if key:
+        return key
+
+    from getpass import getpass
+    return getpass("Enter your FRED API key (https://fred.stlouisfed.org/docs/api/api_key.html): ")
+
+
+def fetch_fred_data(start_date, end_date):
+    """
+    DGS10 / DGS2   -- nominal Treasury yields
+    DFII10         -- 10Y TIPS real yield
+    T10YIE         -- 10Y breakeven inflation (FRED's own DGS10-DFII10 series)
+    THREEFYTP10    -- Adrian-Crump-Moench (ACM) 10Y term premium, published by the NY Fed
+    WEI            -- NY Fed Weekly Economic Index (Lewis-Mertens-Stock): a weekly,
+                      near-real-time growth gauge scaled to a GDP-growth-rate
+                      equivalent, built from 10 high-frequency inputs (claims,
+                      Redbook sales, rail traffic, fuel/electricity use, etc.)
+    All are official government/Fed series -- no proprietary or scraped data.
+    """
+    print("Fetching Treasury yields, TIPS real yield, breakevens, ACM term premium, and WEI from FRED...")
+    fred_tickers = {
+        "DGS10": "US10Y",
+        "DGS2": "US2Y",
+        "DFII10": "REAL_10Y",
+        "T10YIE": "BREAKEVEN_10Y",
+        "THREEFYTP10": "TERM_PREMIUM",
+        "WEI": "GROWTH_INDEX",
+    }
+    fred = Fred(api_key=get_fred_api_key())
+    series = {
+        label: fred.get_series(sid, observation_start=start_date, observation_end=end_date)
+        for sid, label in fred_tickers.items()
+    }
+    df_fred = pd.DataFrame(series)
+    df_fred.ffill(inplace=True)
+    return df_fred
+
+
+def fetch_yfinance_data(start_date, end_date):
+    """
+    SPX  -- equities, proxy for growth/risk appetite
+    OIL  -- WTI crude, dominant near-term driver of inflation breakevens
+    VIX  -- equity volatility, cross-check for the term-premium/uncertainty linkage
+    """
+    print("Fetching SPX, WTI crude, and VIX via yfinance...")
+    yf_tickers = {"SPX": "^GSPC", "OIL": "CL=F", "VIX": "^VIX"}
+
+    raw_df = yf.download(list(yf_tickers.values()), start=start_date, end=end_date, progress=False)
+
+    if isinstance(raw_df.columns, pd.MultiIndex):
+        if "Close" in raw_df.columns.get_level_values(0):
+            out = raw_df.xs("Close", axis=1, level=0)
+        else:
+            out = raw_df.xs("Close", axis=1, level=1)
+    else:
+        out = raw_df[["Close"]] if "Close" in raw_df.columns else raw_df
+
+    out = out.rename(columns={v: k for k, v in yf_tickers.items()})
+    out.ffill(inplace=True)
+    return out
+
+# ==========================================================
+# 2. DECOMPOSITION (algebraic identities, not fitted models)
+# ==========================================================
+
+def build_decomposition(df):
+    df = df.copy()
+
+    # Identity 1: nominal = real yield + breakeven inflation
+    df["CHECK_1_RESIDUAL"] = df["US10Y"] - (df["REAL_10Y"] + df["BREAKEVEN_10Y"])
+
+    # Identity 2: nominal = expected short-rate path + term premium
+    df["EXPECTED_PATH"] = df["US10Y"] - df["TERM_PREMIUM"]
+
+    # Realized 10Y yield volatility -- self-contained substitute for an
+    # implied-vol index (MOVE), built the same way the earlier model did.
+    df["US10Y_DAILY_CHG"] = df["US10Y"].diff(1)
+    df["REALIZED_VOL_21D"] = df["US10Y_DAILY_CHG"].rolling(21).std()
+
+    return df
+
+# ==========================================================
+# 3. WINDOW SELECTION
+# ==========================================================
+
+WINDOW_CHOICES = {
+    "YTD": "Year-to-date (Jan 1 of the current year to latest)",
+    "3M": "Trailing 3 months",
+    "6M": "Trailing 6 months",
+    "12M": "Trailing 12 months",
+}
+
+def prompt_for_window():
+    print("Which window should the decomposition use?")
+    for key, desc in WINDOW_CHOICES.items():
+        print(f"  {key:4s} - {desc}")
+
+    while True:
+        choice = input("Enter YTD, 3M, 6M, or 12M: ").strip().upper()
+        if choice in WINDOW_CHOICES:
+            return choice
+        print(f"'{choice}' not recognized -- please enter one of: {', '.join(WINDOW_CHOICES)}")
+
+
+def resolve_window_start(df, choice):
+    latest_date = df.index.max()
+    if choice == "YTD":
+        return pd.Timestamp(year=latest_date.year, month=1, day=1)
+    months = {"3M": 3, "6M": 6, "12M": 12}[choice]
+    return latest_date - pd.DateOffset(months=months)
+
+# ==========================================================
+# 4. ATTRIBUTION FOR THE SELECTED WINDOW
+# ==========================================================
+
+def attribution_for_window(df, start_date, label):
+    windowed = df[df.index >= start_date]
+    start_row = windowed.iloc[0]
+    end_row = windowed.iloc[-1]
+
+    def bps(a, b):
+        return (b - a) * 100.0
+
+    print("=" * 80)
+    print(f"10Y YIELD DECOMPOSITION -- {label}")
+    print(f"({start_row.name.date()} -> {end_row.name.date()})")
+    print("=" * 80)
+
+    total_move = bps(start_row["US10Y"], end_row["US10Y"])
+    print(f"\nTotal 10Y move: {total_move:+.0f} bps "
+          f"({start_row['US10Y']:.2f}% -> {end_row['US10Y']:.2f}%)")
+    print(f"US2Y move      : {bps(start_row['US2Y'], end_row['US2Y']):+.0f} bps")
+
+    print("\n--- Decomposition 1: Real yield vs. Inflation breakeven ---")
+    real_move = bps(start_row["REAL_10Y"], end_row["REAL_10Y"])
+    breakeven_move = bps(start_row["BREAKEVEN_10Y"], end_row["BREAKEVEN_10Y"])
+    print(f"  Real yield (TIPS)        : {real_move:+.0f} bps")
+    print(f"  Breakeven inflation      : {breakeven_move:+.0f} bps")
+    print(f"  Sum (should ~= total)    : {real_move + breakeven_move:+.0f} bps")
+
+    print("\n--- Decomposition 2: Expected rate path vs. Term premium ---")
+    path_move = bps(start_row["EXPECTED_PATH"], end_row["EXPECTED_PATH"])
+    tp_move = bps(start_row["TERM_PREMIUM"], end_row["TERM_PREMIUM"])
+    print(f"  Expected short-rate path : {path_move:+.0f} bps")
+    print(f"  Term premium (ACM)       : {tp_move:+.0f} bps")
+    print(f"  Sum (should ~= total)    : {path_move + tp_move:+.0f} bps")
+    if abs(path_move) + abs(tp_move) > 0:
+        print(f"  Rate-expectations share  : {abs(path_move)/(abs(path_move)+abs(tp_move)):.0%}")
+
+    print(f"\nWEI (NY Fed Weekly Economic Index), current reading: {end_row['GROWTH_INDEX']:+.2f}")
+    print("  Interpreted as: if this pace persisted for a full quarter, GDP would run "
+          "about this many points above/below its year-ago level.")
+
+    moves = {
+        "total_move": total_move,
+        "Real yield": real_move,
+        "Breakeven inflation": breakeven_move,
+        "Expected path": path_move,
+        "Term premium": tp_move,
+    }
+
+    return windowed, moves
+
+# ==========================================================
+# 5. DRIVER LINKAGES -- descriptive correlations, not a model
+# ==========================================================
+
+def driver_linkages(df, window_start, window_label):
+    print("\n" + "=" * 80)
+    print("WELL-UNDERSTOOD LINKAGES -- CHANGE CORRELATIONS")
+    print(f"(checked over the selected window [{window_label}] and a 2-year lookback,")
+    print(" to separate durable relationships from a window-specific coincidence)")
+    print("=" * 80)
+
+    d = df.copy()
+    d["D_REAL"] = d["REAL_10Y"].diff() * 100          # bps
+    d["D_BREAKEVEN"] = d["BREAKEVEN_10Y"].diff() * 100  # bps
+    d["D_TERM_PREMIUM"] = d["TERM_PREMIUM"].diff() * 100  # bps
+    d["D_SPX"] = d["SPX"].pct_change()
+    d["D_OIL"] = d["OIL"].pct_change()
+    d["D_VIX"] = d["VIX"].diff()
+    d["D_REALIZED_VOL"] = d["REALIZED_VOL_21D"].diff()
+
+    window_mask = d.index >= window_start
+    lookback_mask = d.index >= (d.index.max() - pd.Timedelta(days=730))
+
+    pairs = [
+        ("Real yield chg vs. SPX return", "D_REAL", "D_SPX",
+         "growth/risk-on optimism tends to push real yields up"),
+        ("Breakeven chg vs. Oil return", "D_BREAKEVEN", "D_OIL",
+         "energy prices are a dominant near-term driver of inflation expectations"),
+        ("Term premium chg vs. VIX chg", "D_TERM_PREMIUM", "D_VIX",
+         "risk/uncertainty spikes tend to push the term premium up"),
+        ("Term premium chg vs. realized rate-vol chg", "D_TERM_PREMIUM", "D_REALIZED_VOL",
+         "higher rate volatility demands a higher term premium"),
+    ]
+
+    for label, col_a, col_b, note in pairs:
+        window_corr = d.loc[window_mask, [col_a, col_b]].dropna().corr().iloc[0, 1]
+        lb_corr = d.loc[lookback_mask, [col_a, col_b]].dropna().corr().iloc[0, 1]
+        print(f"\n{label}")
+        print(f"  Selected window ({window_label}) correlation : {window_corr:+.3f}")
+        print(f"  2-year correlation                          : {lb_corr:+.3f}")
+        print(f"  Textbook linkage                            : {note}")
+
+    # --- WEI vs. real yield: resampled to weekly, since WEI only updates
+    # weekly. A daily diff on a ffilled weekly series would be mostly zeros
+    # and would understate any real relationship. ---
+    weekly = d[["REAL_10Y", "GROWTH_INDEX"]].resample("W-SAT").last()
+    weekly["D_REAL_WEEKLY"] = weekly["REAL_10Y"].diff() * 100  # bps
+    weekly["D_WEI"] = weekly["GROWTH_INDEX"].diff()
+
+    weekly_window_mask = weekly.index >= window_start
+    weekly_lookback_mask = weekly.index >= (weekly.index.max() - pd.Timedelta(days=730))
+
+    w_window_corr = weekly.loc[weekly_window_mask, ["D_REAL_WEEKLY", "D_WEI"]].dropna().corr().iloc[0, 1]
+    w_lb_corr = weekly.loc[weekly_lookback_mask, ["D_REAL_WEEKLY", "D_WEI"]].dropna().corr().iloc[0, 1]
+
+    print("\nReal yield chg vs. WEI chg (both resampled to weekly -- WEI's native frequency)")
+    print(f"  Selected window ({window_label}) correlation : {w_window_corr:+.3f}")
+    print(f"  2-year correlation                          : {w_lb_corr:+.3f}")
+    print("  Textbook linkage                            : stronger real growth (higher WEI) "
+          "tends to push real yields up")
+
+    return d
+
+# ==========================================================
+# 6. PIE CHARTS -- contribution breakdown for the selected window
+# ==========================================================
+
+def plot_contribution_pies(moves, window_choice):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+
+    def pie_with_signed_labels(ax, keys, colors, title):
+        values = [abs(moves[k]) for k in keys]
+        labels = [f"{k}\n{moves[k]:+.0f} bps" for k in keys]
+        if sum(values) == 0:
+            ax.text(0.5, 0.5, "No move", ha="center", va="center")
+            ax.set_title(title)
+            return
+        ax.pie(values, labels=labels, colors=colors, autopct=lambda p: f"{p:.0f}%", startangle=90)
+        ax.set_title(title)
+
+        signs = {np.sign(moves[k]) for k in keys if moves[k] != 0}
+        if len(signs) > 1:
+            ax.text(
+                0, -1.35,
+                "Note: components move in opposite directions --\n"
+                "wedge size shows magnitude, not net contribution",
+                ha="center", fontsize=8, style="italic",
+            )
+
+    pie_with_signed_labels(
+        axes[0],
+        ["Real yield", "Breakeven inflation"],
+        ["#4C72B0", "#DD8452"],
+        "Real Yield vs. Breakeven\n(share of move, by magnitude)",
+    )
+
+    pie_with_signed_labels(
+        axes[1],
+        ["Expected path", "Term premium"],
+        ["#55A868", "#C44E52"],
+        "Expected Path vs. Term Premium\n(share of move, by magnitude)",
+    )
+
+    fig.suptitle(f"10Y Move Decomposition -- {window_choice}", y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================================
+# 7. MAIN
+# ==========================================================
+
+def main():
+    fetch_start = "2015-01-01"
+    end_date = date.today().isoformat()
+
+    fred_df = fetch_fred_data(fetch_start, end_date)
+    yf_df = fetch_yfinance_data(fetch_start, end_date)
+
+    combined = fred_df.join(yf_df, how="inner")
+    combined.ffill(inplace=True)
+    combined.dropna(inplace=True)
+
+    print(f"Combined data: {len(combined)} rows, {combined.index.min().date()} to {combined.index.max().date()}")
+
+    enriched = build_decomposition(combined)
+
+    max_residual = enriched["CHECK_1_RESIDUAL"].abs().max()
+    print(f"Sanity check -- max |US10Y - (Real + Breakeven)| residual: {max_residual:.3f} "
+          f"(should be small; FRED computes T10YIE this way directly)\n")
+
+    window_choice = prompt_for_window()
+    window_start = resolve_window_start(enriched, window_choice)
+
+    windowed, moves = attribution_for_window(enriched, window_start, WINDOW_CHOICES[window_choice])
+    driver_linkages(enriched, window_start, window_choice)
+
+    # Line chart covering just the selected window
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+
+    axes[0].plot(windowed.index, windowed["REAL_10Y"], label="Real yield (TIPS)")
+    axes[0].plot(windowed.index, windowed["BREAKEVEN_10Y"], label="Breakeven inflation")
+    axes[0].plot(windowed.index, windowed["US10Y"], label="Nominal 10Y", linestyle="--", color="black")
+    axes[0].set_title(f"Decomposition 1: Real Yield vs. Breakeven Inflation ({window_choice})")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(windowed.index, windowed["EXPECTED_PATH"], label="Expected short-rate path")
+    axes[1].plot(windowed.index, windowed["TERM_PREMIUM"], label="Term premium (ACM)")
+    axes[1].plot(windowed.index, windowed["US10Y"], label="Nominal 10Y", linestyle="--", color="black")
+    axes[1].set_title(f"Decomposition 2: Expected Path vs. Term Premium ({window_choice})")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Pie charts summarizing the same breakdown, at the end
+    plot_contribution_pies(moves, window_choice)
+
+    return enriched
+
+
+if __name__ == "__main__":
+    enriched = main()
